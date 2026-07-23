@@ -3057,6 +3057,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             logger.warning(
                 f"Some weights are not initialized from checkpoints: {unloaded_params}"
             )
+        moh_gate_loaded = any("indexer.linear_gate.weight" in p for p in loaded_params)
+        logger.info(
+            f"[MoH] any indexer.linear_gate.weight in loaded_params: {moh_gate_loaded}"
+        )
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 

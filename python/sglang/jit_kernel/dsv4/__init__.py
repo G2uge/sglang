@@ -11,6 +11,7 @@ from .compress import (
     compress_norm_rope_store,
 )
 from .compress_old import fused_norm_rope_inplace
+from .cu_seqlens import triton_append_cu_seqlens
 from .elementwise import (
     fused_k_norm_rope_flashmla,
     fused_q_indexer_rope_first_quant,
@@ -51,6 +52,7 @@ __all__ = [
     "linear_bf16_fp32",
     "get_paged_mqa_logits_metadata",
     "triton_create_paged_compress_data",
+    "triton_append_cu_seqlens",
     "topk_transform_512",
     "topk_transform_512_v2",
     "plan_topk_v2",

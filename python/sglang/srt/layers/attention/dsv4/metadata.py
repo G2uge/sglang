@@ -49,6 +49,7 @@ Some other notes:
                all related length will be clipped to 512.
 """
 _LARGE_INDEXER_QUERY_THRESHOLD = 11673
+_LOGGED_CU_SEQLENS_METADATA = False
 
 
 def copy_metadata(
@@ -112,8 +113,10 @@ class PagedIndexerMetadata:
     page_size: int
     page_table: torch.Tensor
     c4_seq_lens: torch.Tensor
+    extend_start_loc: Optional[torch.Tensor] = None
     use_prefill_cuda_graph: bool = False
     deep_gemm_metadata: Any = field(init=False, repr=False)
+    cu_seqlens: Optional[torch.Tensor] = field(init=False, repr=False, default=None)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
     nonpaged_plan: Optional[NonPagedIndexerPlan] = field(
         init=False, repr=False, default=None
@@ -129,23 +132,55 @@ class PagedIndexerMetadata:
         else:
             import deep_gemm
 
-            use_jit_indexer = (
-                envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
-                or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
-            )
-            if use_jit_indexer:
-                from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
-            else:
-                from deep_gemm import get_paged_mqa_logits_metadata
-
             _c4 = self.c4_seq_lens.to(torch.int32)
             if _c4.dim() == 1:
                 _c4 = _c4.unsqueeze(-1)
-            self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
-                _c4,
-                self.c4_page_size,
-                deep_gemm.get_num_sms(),
-            )
+
+            if self.extend_start_loc is not None:
+                from deep_gemm import get_paged_mqa_logits_metadata
+                from sglang.jit_kernel.dsv4 import triton_append_cu_seqlens
+
+                self.cu_seqlens = triton_append_cu_seqlens(
+                    self.extend_start_loc.to(torch.int32),
+                    query_rows=self.c4_seq_lens.shape[0],
+                )
+                self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
+                    _c4,
+                    self.c4_page_size,
+                    deep_gemm.get_num_sms(),
+                    cu_seqlens=self.cu_seqlens,
+                )
+                global _LOGGED_CU_SEQLENS_METADATA
+                if not _LOGGED_CU_SEQLENS_METADATA:
+                    _rank = (
+                        torch.distributed.get_rank()
+                        if torch.distributed.is_available()
+                        and torch.distributed.is_initialized()
+                        else -1
+                    )
+                    if _rank in (-1, 0):
+                        print(
+                            "[DSV4 cu_seqlens logits] enabled: "
+                            f"batch_size={self.extend_start_loc.numel()}, "
+                            f"query_rows={self.c4_seq_lens.shape[0]}",
+                            flush=True,
+                        )
+                    _LOGGED_CU_SEQLENS_METADATA = True
+            else:
+                use_jit_indexer = (
+                    envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
+                    or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
+                )
+                if use_jit_indexer:
+                    from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
+                else:
+                    from deep_gemm import get_paged_mqa_logits_metadata
+
+                self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
+                    _c4,
+                    self.c4_page_size,
+                    deep_gemm.get_num_sms(),
+                )
 
             assert isinstance(self.deep_gemm_metadata, torch.Tensor)
 
@@ -173,11 +208,11 @@ class PagedIndexerMetadata:
     def copy_(self, other: PagedIndexerMetadata):
         if is_hip():
             copy_fields = ["page_table", "c4_seq_lens"]
-            assign_fields = ["deep_gemm_metadata", "nonpaged_plan"]
+            assign_fields = ["deep_gemm_metadata", "cu_seqlens", "nonpaged_plan"]
         else:
             copy_fields = ["page_table", "c4_seq_lens", "deep_gemm_metadata"]
-            assign_fields = ["nonpaged_plan"]
-        copy_fields += ["topk_metadata"]
+            assign_fields = ["cu_seqlens", "nonpaged_plan"]
+        copy_fields += ["extend_start_loc", "topk_metadata"]
         copy_metadata(
             src=other,
             dst=self,

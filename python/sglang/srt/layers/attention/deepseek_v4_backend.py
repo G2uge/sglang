@@ -644,12 +644,21 @@ class DeepseekV4AttnBackend(
         self,
         core_attn_metadata: DSV4AttnMetadata,
         *,
+        extend_start_loc: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
     ):
         return PagedIndexerMetadata(
             page_size=self.page_size,
             page_table=core_attn_metadata.page_table,
             c4_seq_lens=core_attn_metadata.c4_topk_lengths_raw,
+            extend_start_loc=extend_start_loc
+            if (
+                envs.SGLANG_OPT_DSV4_USE_CU_SEQLENS_INDEXER.get()
+                and not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+                and not envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+                and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            )
+            else None,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
         )
 
@@ -737,6 +746,7 @@ class DeepseekV4AttnBackend(
         indexer_metadata = (
             self.init_forward_metadata_indexer(
                 core_attn_metadata,
+                extend_start_loc=extend_start_loc,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
             )
             if need_compress

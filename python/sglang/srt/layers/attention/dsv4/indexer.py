@@ -20,6 +20,9 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
     PagedIndexerMetadata,
 )
+from sglang.srt.layers.attention.dsv4.moh_fused_gemm import (
+    fp8_paged_mqa_moh_select_heads_fused_gemm,
+)
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -245,6 +248,65 @@ def fp8_paged_mqa_logits_torch_sm120(
     return logits
 
 
+def fp8_paged_mqa_moh_select_heads_torch(
+    q_fp8: torch.Tensor,
+    weight: torch.Tensor,
+    moh_gate: nn.Linear,
+    topk_heads: int,
+    hidden_state: torch.Tensor,
+    indexer_bias: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """MoH (Mixture of Heads) head selection via a learned linear gate.
+
+    Uses a pre-trained linear layer to score all heads from hidden_state (the
+    full hidden representation, shape [batch, hidden_size]) and selects
+    the top-k most important ones.
+    """
+    batch_size, _, num_heads, head_dim = q_fp8.shape
+    assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
+    assert weight.shape == (batch_size, num_heads)
+    assert hidden_state.shape[0] == batch_size
+    topk_heads = min(topk_heads, num_heads)
+
+    gates = moh_gate(hidden_state)
+    gates = torch.sqrt(F.softplus(gates.float()) + 1e-20)
+
+    scores_for_choice = gates
+    if indexer_bias is not None:
+        scores_for_choice = gates + indexer_bias.unsqueeze(0).float()
+
+    _, topk_idx = torch.topk(scores_for_choice, k=topk_heads, dim=-1, sorted=False)
+    idx_q = topk_idx[:, None, :, None].expand(-1, 1, -1, head_dim)
+    q_selected = q_fp8.gather(2, idx_q)
+
+    weight_selected = weight.gather(1, topk_idx)
+    top_gates = gates.gather(1, topk_idx)
+    weight_selected = weight_selected * top_gates.to(weight_selected.dtype)
+    return q_selected, weight_selected
+
+
+def pad_moh_heads_for_deepgemm(
+    q: torch.Tensor,
+    weight: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    supported_heads = (8, 16, 32, 64)
+    cur_heads = q.shape[2]
+    target_heads = next(
+        (h for h in supported_heads if h >= cur_heads), supported_heads[-1]
+    )
+    if cur_heads == target_heads:
+        return q, weight
+    if cur_heads > target_heads:
+        raise RuntimeError(
+            f"DeepSeek V4 MoH selected {cur_heads} heads, which exceeds the "
+            f"largest DeepGEMM-supported head count {supported_heads[-1]}."
+        )
+    pad_heads = target_heads - cur_heads
+    q = F.pad(q, (0, 0, 0, pad_heads), value=0).contiguous()
+    weight = F.pad(weight, (0, pad_heads), value=0).contiguous()
+    return q, weight
+
+
 def topk_transform_512_pytorch_vectorized(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -331,6 +393,8 @@ def topk_transform_512_pytorch_vectorized(
 
 
 class C4IndexerBackendMixin:
+    _moh_head_selection_logged: bool = False
+
     def __init__(self):
         super().__init__()
         self.debug_use_external_c4_sparse_indices: bool = False
@@ -432,6 +496,7 @@ class C4IndexerBackendMixin:
             or envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
             or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
             or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            or envs.SGLANG_OPT_DSV4_MOH_HEAD_SELECTION.get()
         ):
             return False
         if (
@@ -626,8 +691,30 @@ class C4IndexerBackendMixin:
 
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
+        use_moh_head_selection = envs.SGLANG_OPT_DSV4_MOH_HEAD_SELECTION.get()
+        forward_mode = forward_batch.forward_mode
+        # "Prefill only" means MoH head selection is confined to the context
+        # (prefill) phase and skipped during token generation. Under speculative
+        # decoding the generation step of the target model runs as TARGET_VERIFY
+        # (not DECODE), and the draft model generates via DRAFT_EXTEND_V2, so
+        # both must be treated as generation here or MoH would leak into decode.
+        is_generation_step = (
+            forward_mode.is_decode()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend_v2()
+        )
+        if (
+            use_moh_head_selection
+            and envs.SGLANG_OPT_DSV4_MOH_PREFILL_ONLY.get()
+            and is_generation_step
+        ):
+            # MoH weights are loaded but generation steps skip head selection.
+            # MIXED batches (prefill+decode) still use MoH.
+            use_moh_head_selection = False
         if use_fp4_indexer:
             weights = weights.float()
+            if use_moh_head_selection:
+                raise RuntimeError("DeepSeek V4 MoH indexer prototype only supports FP8.")
             if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
                 raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
             from deep_gemm import fp8_fp4_paged_mqa_logits as fn
@@ -699,16 +786,71 @@ class C4IndexerBackendMixin:
             c4_indexer_kv_cache = c4_indexer_kv_cache.view(
                 c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
             )
-            logits = fn(
-                q,
-                c4_indexer_kv_cache,
-                weights,
-                _c4sl,
-                page_table,
-                indexer_metadata.deep_gemm_metadata,
-                indexer_metadata.max_c4_seq_len,
-                False,
-            )
+            logits_seq_lens = _c4sl
+            if use_moh_head_selection:
+                use_fused_gemm = envs.SGLANG_OPT_DSV4_MOH_FUSED_GEMM.get()
+                if not C4IndexerBackendMixin._moh_head_selection_logged:
+                    print(
+                        f"[DSV4 MoH] head selection enabled: "
+                        f"topk_heads={envs.SGLANG_DSV4_MOH_TOPK_HEADS.get()}, "
+                        f"impl={'fused_gemm' if use_fused_gemm else 'torch'}, "
+                        f"logits_fn={fn.__name__}",
+                        flush=True,
+                    )
+                    C4IndexerBackendMixin._moh_head_selection_logged = True
+                if use_fused_gemm:
+                    q, weights = fp8_paged_mqa_moh_select_heads_fused_gemm(
+                        q,
+                        weights,
+                        c4_indexer.linear_gate,
+                        topk_heads=envs.SGLANG_DSV4_MOH_TOPK_HEADS.get(),
+                        hidden_state=x,
+                        indexer_bias=c4_indexer.indexer_bias,
+                    )
+                else:
+                    q, weights = fp8_paged_mqa_moh_select_heads_torch(
+                        q,
+                        weights,
+                        c4_indexer.linear_gate,
+                        topk_heads=envs.SGLANG_DSV4_MOH_TOPK_HEADS.get(),
+                        hidden_state=x,
+                        indexer_bias=c4_indexer.indexer_bias,
+                    )
+                if not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+                    q, weights = pad_moh_heads_for_deepgemm(q, weights)
+                    logits_seq_lens = (
+                        c4_seq_lens.unsqueeze(-1)
+                        if c4_seq_lens.dim() == 1
+                        else c4_seq_lens
+                    )
+                else:
+                    logits_seq_lens = c4_seq_lens
+
+            # `cu_seqlens` / `deep_gemm_metadata` 已在 `PagedIndexerMetadata.__post_init__`
+            # 构造时算好一次 (跟 no-varlen 路径一致), 这里各层直接复用, 不再重算。
+            if indexer_metadata.cu_seqlens is None:
+                logits = fn(
+                    q,
+                    c4_indexer_kv_cache,
+                    weights,
+                    logits_seq_lens,
+                    page_table,
+                    indexer_metadata.deep_gemm_metadata,
+                    indexer_metadata.max_c4_seq_len,
+                    False,
+                )
+            else:
+                logits = fn(
+                    q,
+                    c4_indexer_kv_cache,
+                    weights,
+                    logits_seq_lens,
+                    page_table,
+                    indexer_metadata.deep_gemm_metadata,
+                    indexer_metadata.max_c4_seq_len,
+                    False,
+                    cu_seqlens=indexer_metadata.cu_seqlens,
+                )
 
         assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
@@ -842,6 +984,17 @@ class C4Indexer(nn.Module):
 
         self.use_fp4_indexer = get_server_args().enable_deepseek_v4_fp4_indexer
         self.alt_streams = alt_streams
+        if envs.SGLANG_OPT_DSV4_MOH_HEAD_SELECTION.get():
+            self.linear_gate = nn.Linear(
+                self.dim,
+                self.n_heads,
+                bias=False,
+                dtype=torch.bfloat16,
+            )
+            self.indexer_bias = nn.Parameter(
+                torch.zeros(self.n_heads, dtype=torch.float32),
+                requires_grad=False,
+            )
 
     def compute_q(
         self,

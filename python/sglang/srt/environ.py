@@ -1008,6 +1008,20 @@ class Envs:
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
+    SGLANG_OPT_DSV4_USE_CU_SEQLENS_INDEXER = EnvBool(False)
+    SGLANG_OPT_DSV4_MOH_HEAD_SELECTION = EnvBool(False)
+    SGLANG_DSV4_MOH_TOPK_HEADS = EnvInt(8)
+    # When True (and MOH_HEAD_SELECTION is on), MoH head selection runs the
+    # fully fused Triton kernel that folds the gate GEMM (tl.dot) + act + bias +
+    # top-k + gather into one kernel (~2x over the split-GEMM path). Off by
+    # default: tl.dot rounds differently from cuBLAS and flips ~0.5% of boundary
+    # head slots, so precision / train-inference consistency testing should keep
+    # this disabled. See dsv4/moh_fused_gemm.py.
+    SGLANG_OPT_DSV4_MOH_FUSED_GEMM = EnvBool(False)
+    # When True, MoH head selection only applies to prefill (EXTEND/MIXED)
+    # batches; pure DECODE batches skip MoH and run the native indexer path.
+    # Weights are still loaded as long as MOH_HEAD_SELECTION is enabled.
+    SGLANG_OPT_DSV4_MOH_PREFILL_ONLY = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.
